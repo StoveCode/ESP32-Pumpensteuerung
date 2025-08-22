@@ -100,11 +100,11 @@ String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   html += "h1 { font-size: 2em; } h2 { font-size: 1.5em; margin-bottom: 20px;}";
   html += "a.button, button { display: inline-block; text-decoration: none; border: none; border-radius: 5px; padding: 12px 24px; font-size: 1em; font-weight: bold; cursor: pointer; transition: all 0.2s ease; }";
   html += "a.button:active, button:active { transform: scale(0.97); }";
-  html += ".on { background-color: #27ae60; color: white; } .on:hover { background-color: #2ecc71; }";
-  html += ".off { background-color: #c0392b; color: white; } .off:hover { background-color: #e74c3c; }";
-  html += ".info-button { background-color: #2980b9; color: white; } .info-button:hover { background-color: #3498db; }";
+  html += ".on { background-color: #27ae60; color: black !important; } .on:hover { background-color: #2ecc71; }";
+  html += ".off { background-color: #c0392b; color: black !important; } .off:hover { background-color: #e74c3c; }";
+  html += ".info-button { background-color: #2980b9; color: black; } .info-button:hover { background-color: #3498db; }";
   html += "#countdown { text-align: center; font-size: 1.2em; margin: 20px 0; color: #34495e; font-weight: bold; }";
-  html += ".grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }";
+  html += ".grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }";
   html += ".grid-item { background: #ecf0f1; padding: 15px; border-radius: 5px; border-left: 5px solid #3498db; }";
   html += ".grid-item p { margin: 0 0 10px 0; } .grid-item p:last-child { margin-bottom: 0; }";
   html += ".grid-item b { color: #2c3e50; }";
