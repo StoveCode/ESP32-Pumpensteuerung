@@ -16,15 +16,15 @@ bool pumpState[3] = {false, false, false};
 unsigned long pumpStart[3] = {0,0,0};
 
 // === Kalibrierwerte (anpassen / per Buttons setzen) ===
-int dryValue = 3500;   // Trocken (Rohwert)
-int wetValue = 1200;   // Nass   (Rohwert)
+int dryValue[3] = {3500, 3500, 3500};   // Trocken (Rohwert) pro Sensor
+int wetValue[3] = {1200, 1200, 1200};   // Nass   (Rohwert) pro Sensor
 
 // === Schaltschwellen ===
-const int startThreshold = 40; // unterhalb -> Pumpe starten
-const int stopThreshold  = 64; // oberhalb  -> Pumpe stoppen
+int startThreshold = 40; // unterhalb -> Pumpe starten
+int stopThreshold  = 64; // oberhalb  -> Pumpe stoppen
 
 // === Zeitsteuerung ===
-const unsigned long pumpDuration = 10000;     // 10 s Max-Laufzeit
+unsigned long pumpDuration = 10000;     // 10 s Max-Laufzeit
 unsigned long lastCheck = 0;
 const unsigned long checkInterval = 10UL * 60UL * 1000UL; // 10 min
 
@@ -42,15 +42,15 @@ unsigned long timeToNextCheck() {
 }
 
 // === Sensor lesen + Umrechnen ===
-int readSoil(int pin) {
-  int value = analogRead(pin);
-  int percent = map(value, dryValue, wetValue, 0, 100);
+int readSoil(int index) {
+  int value = analogRead(sensPins[index]);
+  int percent = map(value, dryValue[index], wetValue[index], 0, 100);
   return constrain(percent, 0, 100);
 }
 
 // === Rohwert lesen ===
-int readRaw(int pin) {
-  return analogRead(pin);
+int readRaw(int index) {
+  return analogRead(sensPins[index]);
 }
 
 // === Pumpensteuerung ===
@@ -71,9 +71,9 @@ void performCheck() {
   lastCheck = millis();
 
   int s[3] = {
-    readSoil(sensPins[0]),
-    readSoil(sensPins[1]),
-    readSoil(sensPins[2])
+    readSoil(0),
+    readSoil(1),
+    readSoil(2)
   };
 
   Serial.printf("Check @ %lu ms: S1=%d%%, S2=%d%%, S3=%d%%\n", millis(), s[0], s[1], s[2]);
@@ -88,70 +88,109 @@ void performCheck() {
 String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   unsigned long nextInSec = timeToNextCheck();
 
-  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
-  html += "<meta http-equiv='refresh' content='5'>";
+  String html = "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta http-equiv='refresh' content='10'>";
   html += "<title>ESP32 Bewässerung</title>";
   html += "<style>";
-  html += "body { font-family: Arial; text-align:center; margin: 40px; }";
-  html += "button { width:180px; height:50px; font-size:18px; margin:10px; border-radius:10px; }";
-  html += ".on { background:green; color:white; }";
-  html += ".off { background:red; color:white; }";
-  html += "#countdown { font-size: 22px; margin:20px; color:blue; }";
-  html += ".info { position: absolute; top: 10px; right: 20px; font-size:14px; color: gray; text-align:right; }";
+  html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f4f9; color: #333; margin: 0; padding: 20px; }";
+  html += ".container { max-width: 800px; margin: 0 auto; }";
+  html += ".card { background: #fff; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); padding: 25px; margin-bottom: 20px; }";
+  html += "h1, h2 { text-align: center; color: #2c3e50; border-bottom: 2px solid #ecf0f1; padding-bottom: 10px; margin-top: 0; }";
+  html += "h1 { font-size: 2em; } h2 { font-size: 1.5em; margin-bottom: 20px;}";
+  html += "a.button, button { display: inline-block; text-decoration: none; border: none; border-radius: 5px; padding: 12px 24px; font-size: 1em; font-weight: bold; cursor: pointer; transition: all 0.2s ease; }";
+  html += "a.button:active, button:active { transform: scale(0.97); }";
+  html += ".on { background-color: #27ae60; color: white; } .on:hover { background-color: #2ecc71; }";
+  html += ".off { background-color: #c0392b; color: white; } .off:hover { background-color: #e74c3c; }";
+  html += ".info-button { background-color: #2980b9; color: white; } .info-button:hover { background-color: #3498db; }";
+  html += "#countdown { text-align: center; font-size: 1.2em; margin: 20px 0; color: #34495e; font-weight: bold; }";
+  html += ".grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }";
+  html += ".grid-item { background: #ecf0f1; padding: 15px; border-radius: 5px; border-left: 5px solid #3498db; }";
+  html += ".grid-item p { margin: 0 0 10px 0; } .grid-item p:last-child { margin-bottom: 0; }";
+  html += ".grid-item b { color: #2c3e50; }";
+  html += ".grid-item a { color: #2980b9; text-decoration: none; font-weight: bold; } .grid-item a:hover { text-decoration: underline; }";
+  html += "form { margin-top: 10px; }";
+  html += "form input[type='number'] { width: 60px; padding: 8px; border: 1px solid #bdc3c7; border-radius: 4px; }";
+  html += "form input[type='submit'] { width: auto; padding: 8px 12px; margin-left: 10px; }";
+  html += ".center-text { text-align: center; }";
   html += "</style></head><body>";
 
-  // Info-Box: Rohwerte, Kalibrierung, Schwellen
-  html += "<div class='info'>";
-  html += "<b>Rohwerte</b><br>";
-  html += "S1: " + String(r1) + "<br>";
-  html += "S2: " + String(r2) + "<br>";
-  html += "S3: " + String(r3) + "<br><br>";
-  html += "<b>Kalibrierung</b><br>";
-  html += "Trocken = " + String(dryValue) + "<br>";
-  html += "Nass = " + String(wetValue) + "<br><br>";
-  html += "<b>Schwellen</b><br>";
-  html += "Start &lt; " + String(startThreshold) + "%<br>";
-  html += "Stop  &gt; " + String(stopThreshold) + "%<br><br>";
-  html += "<a href='/setDry'><button class='off'>Trocken setzen</button></a><br>";
-  html += "<a href='/setWet'><button class='on'>Nass setzen</button></a>";
-  html += "</div>";
-
+  html += "<div class='container'>";
   html += "<h1>ESP32 Bewässerungssystem</h1>";
 
   // Betriebsmodus
+  html += "<div class='card center-text'>";
   html += "<h2>Betriebsmodus: " + String(autoMode ? "Automatik" : "Manuell") + "</h2>";
   if (autoMode) {
-    html += "<a href='/mode/manual'><button class='off'>Wechsel zu Manuell</button></a>";
-  } else {
-    html += "<a href='/mode/auto'><button class='on'>Wechsel zu Automatik</button></a>";
-  }
-
-  // Countdown + Sofortprüfung
-  if (autoMode) {
+    html += "<a href='/mode/manual' class='button off'>Zu Manuell wechseln</a>";
     html += "<div id='countdown'>Nächste Prüfung in " + String(nextInSec) + " Sekunden</div>";
-    html += "<a href='/checknow'><button class='on'>Prüfung jetzt starten</button></a>";
-    html += "<script>";
-    html += "var seconds=" + String(nextInSec) + ";";
-    html += "setInterval(function(){ if(seconds>0){ seconds--; document.getElementById('countdown').innerHTML='Nächste Prüfung in '+seconds+' Sekunden'; }},1000);";
-    html += "</script>";
+    html += "<a href='/checknow' class='button info-button'>Prüfung jetzt starten</a>";
+  } else {
+    html += "<a href='/mode/auto' class='button on'>Zu Automatik wechseln</a>";
   }
+  html += "</div>";
 
-  // Sensorwerte (in %)
-  html += "<h2>Sensorwerte</h2>";
-  html += "<p>Sensor 1: " + String(s1) + " %</p>";
-  html += "<p>Sensor 2: " + String(s2) + " %</p>";
-  html += "<p>Sensor 3: " + String(s3) + " %</p>";
-
-  // Pumpensteuerung
-  html += "<h2>Pumpensteuerung</h2>";
+  // Sensorwerte & Pumpen
+  html += "<div class='card'>";
+  html += "<h2>Live-Status</h2>";
+  html += "<div class='grid-container'>";
   for (int i = 0; i < 3; i++) {
-    html += "<p>Pumpe " + String(i+1) + ": ";
+    int s = (i == 0) ? s1 : (i == 1) ? s2 : s3;
+    html += "<div class='grid-item'>";
+    html += "<p><b>Sensor " + String(i+1) + ":</b> " + String(s) + " %</p>";
+    html += "<p><b>Pumpe " + String(i+1) + ":</b> " + String(pumpState[i] ? "EIN" : "AUS") + "</p>";
     if (pumpState[i]) {
-      html += "<a href='/pump" + String(i+1) + "/off'><button class='off'>AUS</button></a>";
+      html += "<a href='/pump" + String(i+1) + "/off' class='button off'>Pumpe " + String(i+1) + " AUS</a>";
     } else {
-      html += "<a href='/pump" + String(i+1) + "/on'><button class='on'>EIN</button></a>";
+      html += "<a href='/pump" + String(i+1) + "/on' class='button on'>Pumpe " + String(i+1) + " EIN</a>";
     }
-    html += "</p>";
+    html += "</div>";
+  }
+  html += "</div></div>";
+
+  // Konfiguration
+  html += "<div class='card'>";
+  html += "<h2>Konfiguration</h2>";
+  html += "<div class='grid-container'>";
+  // Kalibrierung
+  html += "<div class='grid-item'>";
+  html += "<b>Kalibrierung</b> ([T]rocken/[N]ass)";
+  for (int i = 0; i < 3; i++) {
+    int r = (i == 0) ? r1 : (i == 1) ? r2 : r3;
+    html += "<p>S" + String(i+1) + ": " + String(dryValue[i]) + "/" + String(wetValue[i]);
+    html += " (Roh: " + String(r) + ") ";
+    html += "<a href='/setDry/" + String(i) + "'>[T]</a> ";
+    html += "<a href='/setWet/" + String(i) + "'>[N]</a></p>";
+  }
+  html += "</div>";
+  // Schwellen
+  html += "<div class='grid-item'>";
+  html += "<b>Schwellenwerte</b>";
+  html += "<form action='/setThresholds' method='POST'>";
+  html += "<p>Start &lt; <input type='number' name='start' value='" + String(startThreshold) + "'> %</p>";
+  html += "<p>Stop &gt; <input type='number' name='stop' value='" + String(stopThreshold) + "'> %</p>";
+  html += "<input type='submit' value='Setzen' class='button info-button'>";
+  html += "</form>";
+  html += "</div>";
+  // Zeitsteuerung
+  html += "<div class='grid-item'>";
+  html += "<b>Zeitsteuerung</b>";
+  html += "<form action='/setDuration' method='POST'>";
+  html += "<p>Max. Laufzeit: <input type='number' name='duration' value='" + String(pumpDuration / 1000) + "'> s</p>";
+  html += "<input type='submit' value='Setzen' class='button info-button'>";
+  html += "</form>";
+  html += "</div>";
+  html += "</div></div>";
+
+  html += "</div>"; // end container
+
+  // Javascript für Countdown
+  if (autoMode) {
+    html += "<script>";
+    html += "var s=" + String(nextInSec) + ";";
+    html += "var cd=document.getElementById('countdown');";
+    html += "if(cd){var i=setInterval(function(){if(s>0){s--;cd.innerHTML='Nächste Prüfung in '+s+' Sekunden'}else{cd.innerHTML='Prüfung startet...';clearInterval(i)}},1000);}";
+    html += "</script>";
   }
 
   html += "</body></html>";
@@ -160,13 +199,13 @@ String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
 
 // === Root Handler ===
 void handleRoot() {
-  int s1 = readSoil(sensPins[0]);
-  int s2 = readSoil(sensPins[1]);
-  int s3 = readSoil(sensPins[2]);
+  int s1 = readSoil(0);
+  int s2 = readSoil(1);
+  int s3 = readSoil(2);
 
-  int r1 = readRaw(sensPins[0]);
-  int r2 = readRaw(sensPins[1]);
-  int r3 = readRaw(sensPins[2]);
+  int r1 = readRaw(0);
+  int r2 = readRaw(1);
+  int r3 = readRaw(2);
 
   server.send(200, "text/html", getHTML(s1, s2, s3, r1, r2, r3));
 }
@@ -200,17 +239,34 @@ void setup() {
 
   server.on("/checknow", [](){ performCheck(); server.sendHeader("Location", "/"); server.send(303); });
 
-  // Kalibrierung über Buttons (nimmt Sensor 1 als Referenz)
-  server.on("/setDry", [](){
-    dryValue = analogRead(sensPins[0]);
-    Serial.printf("Neuer Trockenwert: %d\n", dryValue);
-    server.sendHeader("Location", "/"); server.send(303);
+  server.on("/setThresholds", HTTP_POST, [](){
+    if (server.hasArg("start")) startThreshold = server.arg("start").toInt();
+    if (server.hasArg("stop"))  stopThreshold  = server.arg("stop").toInt();
+    Serial.printf("Neue Schwellen: Start=%d%%, Stop=%d%%\n", startThreshold, stopThreshold);
+    server.sendHeader("Location", "/");
+    server.send(303);
   });
-  server.on("/setWet", [](){
-    wetValue = analogRead(sensPins[0]);
-    Serial.printf("Neuer Nasswert: %d\n", wetValue);
-    server.sendHeader("Location", "/"); server.send(303);
+
+  server.on("/setDuration", HTTP_POST, [](){
+    if (server.hasArg("duration")) pumpDuration = server.arg("duration").toInt() * 1000;
+    Serial.printf("Neue max. Laufzeit: %lu s\n", pumpDuration / 1000);
+    server.sendHeader("Location", "/");
+    server.send(303);
   });
+
+  // Kalibrierung über Buttons (pro Sensor)
+  for (int i = 0; i < 3; i++) {
+    server.on(("/setDry/" + String(i)).c_str(), [i](){
+      dryValue[i] = analogRead(sensPins[i]);
+      Serial.printf("Neuer Trockenwert für Sensor %d: %d\n", i+1, dryValue[i]);
+      server.sendHeader("Location", "/"); server.send(303);
+    });
+    server.on(("/setWet/" + String(i)).c_str(), [i](){
+      wetValue[i] = analogRead(sensPins[i]);
+      Serial.printf("Neuer Nasswert für Sensor %d: %d\n", i+1, wetValue[i]);
+      server.sendHeader("Location", "/"); server.send(303);
+    });
+  }
 
   server.begin();
   lastCheck = millis();
@@ -229,7 +285,7 @@ void loop() {
     // Laufende Pumpen: 1) Stop-Schwelle  2) Sicherheits-Timeout
     for (int i = 0; i < 3; i++) {
       if (pumpState[i]) {
-        int moisture = readSoil(sensPins[i]);
+        int moisture = readSoil(i);
         if (moisture > stopThreshold) {          // <-- HIER: sofort stoppen bei >64%
           setPump(i, false);
           Serial.printf("Pumpe %d wegen >%d%% gestoppt (aktuell %d%%)\n", i+1, stopThreshold, moisture);
