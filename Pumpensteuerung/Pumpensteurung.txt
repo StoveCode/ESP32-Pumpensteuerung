@@ -1,0 +1,243 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// === WLAN Zugangsdaten ===
+const char* ssid     = "iot";
+const char* password = "iotiotiot!";
+
+// === Relais Pins (Pumpen) ===
+const int pumpPins[3] = {16, 17, 18};
+
+// === Sensor Pins (Analog) ===
+const int sensPins[3] = {34, 35, 32};
+
+// === Pumpenzustände ===
+bool pumpState[3] = {false, false, false};
+unsigned long pumpStart[3] = {0,0,0};
+
+// === Kalibrierwerte (anpassen / per Buttons setzen) ===
+int dryValue = 3500;   // Trocken (Rohwert)
+int wetValue = 1200;   // Nass   (Rohwert)
+
+// === Schaltschwellen ===
+const int startThreshold = 40; // unterhalb -> Pumpe starten
+const int stopThreshold  = 64; // oberhalb  -> Pumpe stoppen
+
+// === Zeitsteuerung ===
+const unsigned long pumpDuration = 10000;     // 10 s Max-Laufzeit
+unsigned long lastCheck = 0;
+const unsigned long checkInterval = 10UL * 60UL * 1000UL; // 10 min
+
+// === Automatik/Manuell ===
+bool autoMode = true;
+
+// === Webserver ===
+WebServer server(80);
+
+// === Hilfsfunktion: Restzeit bis nächste Prüfung ===
+unsigned long timeToNextCheck() {
+  unsigned long now = millis();
+  if (now - lastCheck >= checkInterval) return 0;
+  return (lastCheck + checkInterval - now) / 1000; // Sekunden
+}
+
+// === Sensor lesen + Umrechnen ===
+int readSoil(int pin) {
+  int value = analogRead(pin);
+  int percent = map(value, dryValue, wetValue, 0, 100);
+  return constrain(percent, 0, 100);
+}
+
+// === Rohwert lesen ===
+int readRaw(int pin) {
+  return analogRead(pin);
+}
+
+// === Pumpensteuerung ===
+void setPump(int pump, bool state) {
+  pumpState[pump] = state;
+  digitalWrite(pumpPins[pump], state ? LOW : HIGH); // Relais aktiv LOW
+  if (state && autoMode) pumpStart[pump] = millis();
+}
+
+void handlePump(int pump, bool state) {
+  setPump(pump, state);
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// === Automatische Prüfung durchführen ===
+void performCheck() {
+  lastCheck = millis();
+
+  int s[3] = {
+    readSoil(sensPins[0]),
+    readSoil(sensPins[1]),
+    readSoil(sensPins[2])
+  };
+
+  Serial.printf("Check @ %lu ms: S1=%d%%, S2=%d%%, S3=%d%%\n", millis(), s[0], s[1], s[2]);
+
+  // Start-Bedingung (untere Schwelle)
+  for (int i = 0; i < 3; i++) {
+    if (s[i] < startThreshold && !pumpState[i]) setPump(i, true);
+  }
+}
+
+// === HTML-Seite ===
+String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
+  unsigned long nextInSec = timeToNextCheck();
+
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  html += "<meta http-equiv='refresh' content='5'>";
+  html += "<title>ESP32 Bewässerung</title>";
+  html += "<style>";
+  html += "body { font-family: Arial; text-align:center; margin: 40px; }";
+  html += "button { width:180px; height:50px; font-size:18px; margin:10px; border-radius:10px; }";
+  html += ".on { background:green; color:white; }";
+  html += ".off { background:red; color:white; }";
+  html += "#countdown { font-size: 22px; margin:20px; color:blue; }";
+  html += ".info { position: absolute; top: 10px; right: 20px; font-size:14px; color: gray; text-align:right; }";
+  html += "</style></head><body>";
+
+  // Info-Box: Rohwerte, Kalibrierung, Schwellen
+  html += "<div class='info'>";
+  html += "<b>Rohwerte</b><br>";
+  html += "S1: " + String(r1) + "<br>";
+  html += "S2: " + String(r2) + "<br>";
+  html += "S3: " + String(r3) + "<br><br>";
+  html += "<b>Kalibrierung</b><br>";
+  html += "Trocken = " + String(dryValue) + "<br>";
+  html += "Nass = " + String(wetValue) + "<br><br>";
+  html += "<b>Schwellen</b><br>";
+  html += "Start &lt; " + String(startThreshold) + "%<br>";
+  html += "Stop  &gt; " + String(stopThreshold) + "%<br><br>";
+  html += "<a href='/setDry'><button class='off'>Trocken setzen</button></a><br>";
+  html += "<a href='/setWet'><button class='on'>Nass setzen</button></a>";
+  html += "</div>";
+
+  html += "<h1>ESP32 Bewässerungssystem</h1>";
+
+  // Betriebsmodus
+  html += "<h2>Betriebsmodus: " + String(autoMode ? "Automatik" : "Manuell") + "</h2>";
+  if (autoMode) {
+    html += "<a href='/mode/manual'><button class='off'>Wechsel zu Manuell</button></a>";
+  } else {
+    html += "<a href='/mode/auto'><button class='on'>Wechsel zu Automatik</button></a>";
+  }
+
+  // Countdown + Sofortprüfung
+  if (autoMode) {
+    html += "<div id='countdown'>Nächste Prüfung in " + String(nextInSec) + " Sekunden</div>";
+    html += "<a href='/checknow'><button class='on'>Prüfung jetzt starten</button></a>";
+    html += "<script>";
+    html += "var seconds=" + String(nextInSec) + ";";
+    html += "setInterval(function(){ if(seconds>0){ seconds--; document.getElementById('countdown').innerHTML='Nächste Prüfung in '+seconds+' Sekunden'; }},1000);";
+    html += "</script>";
+  }
+
+  // Sensorwerte (in %)
+  html += "<h2>Sensorwerte</h2>";
+  html += "<p>Sensor 1: " + String(s1) + " %</p>";
+  html += "<p>Sensor 2: " + String(s2) + " %</p>";
+  html += "<p>Sensor 3: " + String(s3) + " %</p>";
+
+  // Pumpensteuerung
+  html += "<h2>Pumpensteuerung</h2>";
+  for (int i = 0; i < 3; i++) {
+    html += "<p>Pumpe " + String(i+1) + ": ";
+    if (pumpState[i]) {
+      html += "<a href='/pump" + String(i+1) + "/off'><button class='off'>AUS</button></a>";
+    } else {
+      html += "<a href='/pump" + String(i+1) + "/on'><button class='on'>EIN</button></a>";
+    }
+    html += "</p>";
+  }
+
+  html += "</body></html>";
+  return html;
+}
+
+// === Root Handler ===
+void handleRoot() {
+  int s1 = readSoil(sensPins[0]);
+  int s2 = readSoil(sensPins[1]);
+  int s3 = readSoil(sensPins[2]);
+
+  int r1 = readRaw(sensPins[0]);
+  int r2 = readRaw(sensPins[1]);
+  int r3 = readRaw(sensPins[2]);
+
+  server.send(200, "text/html", getHTML(s1, s2, s3, r1, r2, r3));
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+
+  for (int i=0;i<3;i++) {
+    pinMode(pumpPins[i], OUTPUT);
+    digitalWrite(pumpPins[i], HIGH); // Relais aus (active LOW)
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Verbinde mit WLAN");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println(" verbunden!");
+  Serial.print("IP-Adresse: ");
+  Serial.println(WiFi.localIP());
+
+  // Webserver Routen
+  server.on("/", handleRoot);
+
+  for (int i = 0; i < 3; i++) {
+    server.on(("/pump" + String(i+1) + "/on").c_str(),  [i](){ handlePump(i, true);  });
+    server.on(("/pump" + String(i+1) + "/off").c_str(), [i](){ handlePump(i, false); });
+  }
+
+  server.on("/mode/auto", [](){   autoMode = true;  server.sendHeader("Location", "/"); server.send(303); });
+  server.on("/mode/manual", [](){ autoMode = false; server.sendHeader("Location", "/"); server.send(303); });
+
+  server.on("/checknow", [](){ performCheck(); server.sendHeader("Location", "/"); server.send(303); });
+
+  // Kalibrierung über Buttons (nimmt Sensor 1 als Referenz)
+  server.on("/setDry", [](){
+    dryValue = analogRead(sensPins[0]);
+    Serial.printf("Neuer Trockenwert: %d\n", dryValue);
+    server.sendHeader("Location", "/"); server.send(303);
+  });
+  server.on("/setWet", [](){
+    wetValue = analogRead(sensPins[0]);
+    Serial.printf("Neuer Nasswert: %d\n", wetValue);
+    server.sendHeader("Location", "/"); server.send(303);
+  });
+
+  server.begin();
+  lastCheck = millis();
+}
+
+// === Loop ===
+void loop() {
+  server.handleClient();
+
+  if (autoMode) {
+    unsigned long now = millis();
+
+    // Alle 10 Minuten Start-Check
+    if (now - lastCheck >= checkInterval) performCheck();
+
+    // Laufende Pumpen: 1) Stop-Schwelle  2) Sicherheits-Timeout
+    for (int i = 0; i < 3; i++) {
+      if (pumpState[i]) {
+        int moisture = readSoil(sensPins[i]);
+        if (moisture > stopThreshold) {          // <-- HIER: sofort stoppen bei >64%
+          setPump(i, false);
+          Serial.printf("Pumpe %d wegen >%d%% gestoppt (aktuell %d%%)\n", i+1, stopThreshold, moisture);
+        } else if (now - pumpStart[i] > pumpDuration) {
+          setPump(i, false);
+          Serial.printf("Pumpe %d nach %lus Timeout gestoppt\n", i+1, pumpDuration/1000);
+        }
+      }
+    }
+  }
+}
