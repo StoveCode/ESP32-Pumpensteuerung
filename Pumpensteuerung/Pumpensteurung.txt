@@ -20,8 +20,8 @@ int dryValue[3] = {3500, 3500, 3500};   // Trocken (Rohwert) pro Sensor
 int wetValue[3] = {1200, 1200, 1200};   // Nass   (Rohwert) pro Sensor
 
 // === Schaltschwellen ===
-int startThreshold = 60; // unterhalb -> Pumpe starten
-int stopThreshold  = 65; // oberhalb  -> Pumpe stoppen
+int startThreshold = 40; // unterhalb -> Pumpe starten
+int stopThreshold  = 64; // oberhalb  -> Pumpe stoppen
 
 // === Zeitsteuerung ===
 unsigned long pumpDuration = 10000;     // 10 s Max-Laufzeit
