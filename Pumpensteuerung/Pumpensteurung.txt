@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 
 // === WLAN Zugangsdaten ===
 const char* ssid     = "iot";
@@ -14,10 +15,31 @@ const int sensPins[3] = {34, 35, 32};
 // === Pumpenzustände ===
 bool pumpState[3] = {false, false, false};
 unsigned long pumpStart[3] = {0,0,0};
+unsigned long lastPumpStop[3] = {0,0,0};
+
+// === Mapping Sensor -> Pumpe (konfigurierbar) ===
+// sensorToPump[i] = Pumpenindex (0..2), die von Sensor i gesteuert wird
+int sensorToPump[3] = {0,1,2};
+// Inverse Zuordnung (zur Laufzeit gebaut): pumpToSensor[p] = Sensorindex
+int pumpToSensor[3] = {0,1,2};
+
+void rebuildPumpToSensor() {
+  // Initial auf -1 setzen für Debug-Fälle
+  for (int i=0;i<3;i++) pumpToSensor[i] = -1;
+  for (int s=0;s<3;s++) {
+    int p = sensorToPump[s];
+  // Ersten Sensor merken, nicht überschreiben -> verhindert, dass letzter gewinnt
+  if (p >=0 && p < 3 && pumpToSensor[p] == -1) pumpToSensor[p] = s;
+  }
+  // Fallback falls etwas schief: fehlende Belegungen linear füllen
+  for (int p=0;p<3;p++) if (pumpToSensor[p] == -1) pumpToSensor[p] = p; 
+}
 
 // === Kalibrierwerte (anpassen / per Buttons setzen) ===
-int dryValue[3] = {3500, 3500, 3500};   // Trocken (Rohwert) pro Sensor
-int wetValue[3] = {1200, 1200, 1200};   // Nass   (Rohwert) pro Sensor
+int dryValue[3] = {2138, 2138, 2138};   // Trocken (Rohwert) pro Sensor
+int wetValue[3] = {1216, 1216, 1216};   // Nass   (Rohwert) pro Sensor
+
+// S2: 2138/1216 (Roh: 1214)
 
 // === Schaltschwellen ===
 int startThreshold = 40; // unterhalb -> Pumpe starten
@@ -26,10 +48,107 @@ int stopThreshold  = 64; // oberhalb  -> Pumpe stoppen
 // === Zeitsteuerung ===
 unsigned long pumpDuration = 10000;     // 10 s Max-Laufzeit
 unsigned long lastCheck = 0;
-const unsigned long checkInterval = 10UL * 60UL * 1000UL; // 10 min
+unsigned long checkIntervalMs = 30UL * 60UL * 1000UL; // Standard 30 min, konfigurierbar
 
 // === Automatik/Manuell ===
 bool autoMode = true;
+
+// (Filter entfernt – direkte Messung)
+
+// === Polling Intervall für Status-Updates (Sekunden, fest) ===
+const int updateIntervalSec = 9; // 9s
+unsigned long pumpCooldownMs = 30000; // Mindest-Pause nach Lauf (30s)
+
+// === Persistenz ===
+Preferences prefs;
+bool configDirty = false;
+unsigned long nextConfigSave = 0;
+const unsigned long configSaveDelay = 5000; // 5s Sammelzeit für Flash-Schreib-Throttle
+
+void markConfigDirty() {
+  configDirty = true;
+  nextConfigSave = millis() + configSaveDelay;
+}
+
+void clampThresholds() {
+  // Sicherstellen: start < stop - 2 (Hysterese)
+  if (startThreshold < 0) startThreshold = 0;
+  if (stopThreshold > 100) stopThreshold = 100;
+  if (startThreshold > 95) startThreshold = 95;
+  if (stopThreshold < 5) stopThreshold = 5;
+  if (startThreshold >= stopThreshold - 2) {
+    // Erzwinge Mindestabstand
+    stopThreshold = startThreshold + 3;
+    if (stopThreshold > 100) { stopThreshold = 100; startThreshold = stopThreshold - 3; }
+  }
+}
+
+void clampPumpDuration() {
+  if (pumpDuration < 1000UL) pumpDuration = 1000UL; // min 1s
+  if (pumpDuration > 3600000UL) pumpDuration = 3600000UL; // max 1h
+}
+
+void clampCooldown() {
+  if (pumpCooldownMs > 3600000UL) pumpCooldownMs = 3600000UL; // max 1h
+}
+
+void clampCheckInterval() {
+  // Mindest 1 Minute, Maximum 24h
+  if (checkIntervalMs < 60000UL) checkIntervalMs = 60000UL;
+  if (checkIntervalMs > 24UL * 60UL * 60000UL) checkIntervalMs = 24UL * 60UL * 60000UL;
+}
+
+void saveConfig();
+
+void loadConfig() {
+  if (!prefs.begin("pumpcfg", false)) return;
+  startThreshold   = prefs.getUInt("startTh", startThreshold);
+  stopThreshold    = prefs.getUInt("stopTh",  stopThreshold);
+  pumpDuration     = prefs.getULong("pDur",    pumpDuration);
+  pumpCooldownMs     = prefs.getULong("pCool", pumpCooldownMs);
+  checkIntervalMs    = prefs.getULong("chkInt", checkIntervalMs);
+  for (int i=0;i<3;i++) {
+    dryValue[i]   = prefs.getInt((String("dry")+i).c_str(), dryValue[i]);
+    wetValue[i]   = prefs.getInt((String("wet")+i).c_str(), wetValue[i]);
+    sensorToPump[i] = prefs.getInt((String("map")+i).c_str(), sensorToPump[i]);
+  }
+  clampThresholds();
+  clampPumpDuration();
+  clampCooldown();
+  clampCheckInterval();
+  prefs.end();
+}
+
+void saveConfig() {
+  if (!prefs.begin("pumpcfg", false)) return;
+  prefs.putUInt("startTh", startThreshold);
+  prefs.putUInt("stopTh",  stopThreshold);
+  prefs.putULong("pDur",   pumpDuration);
+  prefs.putULong("pCool",  pumpCooldownMs);
+  prefs.putULong("chkInt", checkIntervalMs);
+  for (int i=0;i<3;i++) {
+    prefs.putInt((String("dry")+i).c_str(), dryValue[i]);
+    prefs.putInt((String("wet")+i).c_str(), wetValue[i]);
+    prefs.putInt((String("map")+i).c_str(), sensorToPump[i]);
+  }
+  prefs.end();
+  configDirty = false;
+  Serial.println("Config gespeichert");
+}
+
+// === Diagnose / Stabilität ===
+unsigned long lastDiag = 0;
+const unsigned long diagInterval = 60000; // 60s
+void diagLog(unsigned long nowMs) {
+  // Prüfe auf doppelte Pumpen-Zuordnung
+  bool dup = false;
+  for (int p=0;p<3;p++) {
+    int count = 0; for (int s=0;s<3;s++) if (sensorToPump[s]==p) count++;
+    if (count > 1) { dup = true; break; }
+  }
+  Serial.printf("DIAG uptime=%lus free=%u min=%u mappingDup=%s\n", nowMs/1000, ESP.getFreeHeap(), ESP.getMinFreeHeap(), dup?"YES":"NO");
+  if (configDirty) saveConfig();
+}
 
 // === Webserver ===
 WebServer server(80);
@@ -37,15 +156,38 @@ WebServer server(80);
 // === Hilfsfunktion: Restzeit bis nächste Prüfung ===
 unsigned long timeToNextCheck() {
   unsigned long now = millis();
-  if (now - lastCheck >= checkInterval) return 0;
-  return (lastCheck + checkInterval - now) / 1000; // Sekunden
+  if (now - lastCheck >= checkIntervalMs) return 0;
+  return (lastCheck + checkIntervalMs - now) / 1000; // Sekunden
 }
 
 // === Sensor lesen + Umrechnen ===
 int readSoil(int index) {
-  int value = analogRead(sensPins[index]);
-  int percent = map(value, dryValue[index], wetValue[index], 0, 100);
-  return constrain(percent, 0, 100);
+  // Ursprünglich wurde map(dry, wet) genutzt. Wenn dryValue > wetValue (typisch),
+  // ist die Reihenfolge für map() invertiert und führt zu falschen/gleichen Werten
+  // (oft 0%), wodurch alle Pumpen gleichzeitig starten. Deshalb hier eine eigene
+  // lineare Umrechnung, die sowohl vertauschte als auch richtige Kalibrierwerte toleriert.
+  // Direkter Rohwert ohne Filter
+  int raw = analogRead(sensPins[index]);
+  int dry = dryValue[index];
+  int wet = wetValue[index];
+
+  if (dry == wet) { Serial.printf("Warn: Kalibrierung Sensor %d identische Werte (%d) -> 100%%\n", index+1, dry); return 100; }
+
+  // Sicherstellen, dass 'dry' der größere Wert ist (bei kapazitiven Sensoren: trocken = höherer Rohwert)
+  bool swapped = false;
+  if (dry < wet) { int t = dry; dry = wet; wet = t; swapped = true; }
+
+  // Prozent berechnen: trocken (dry) -> 0%, nass (wet) -> 100%
+  long span = (long)dry - (long)wet; // positiv
+  long pos = (long)dry - (long)raw;  // 0 .. span (ideal)
+  int percent = (int)((pos * 100L) / span);
+
+  // Korrektur falls vertauscht kalibriert wurde
+  if (swapped) percent = 100 - percent;
+
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
 }
 
 // === Rohwert lesen ===
@@ -57,10 +199,16 @@ int readRaw(int index) {
 void setPump(int pump, bool state) {
   pumpState[pump] = state;
   digitalWrite(pumpPins[pump], state ? LOW : HIGH); // Relais aktiv LOW
-  if (state && autoMode) pumpStart[pump] = millis();
+  if (state) pumpStart[pump] = millis(); // Immer Startzeit setzen (auch im manuellen Modus)
+  if (!state) lastPumpStop[pump] = millis();
 }
 
 void handlePump(int pump, bool state) {
+  if (autoMode) { // Im Automatikmodus keine manuelle Steuerung zulassen
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
   setPump(pump, state);
   server.sendHeader("Location", "/");
   server.send(303);
@@ -78,19 +226,29 @@ void performCheck() {
 
   Serial.printf("Check @ %lu ms: S1=%d%%, S2=%d%%, S3=%d%%\n", millis(), s[0], s[1], s[2]);
 
-  // Start-Bedingung (untere Schwelle)
-  for (int i = 0; i < 3; i++) {
-    if (s[i] < startThreshold && !pumpState[i]) setPump(i, true);
+  // Start-Bedingung (untere Schwelle) je Sensor -> zugeordnete Pumpe
+  for (int sensor = 0; sensor < 3; sensor++) {
+    int pump = sensorToPump[sensor];
+    if (pump < 0 || pump > 2) continue; // Schutz
+    if (s[sensor] < startThreshold && !pumpState[pump]) {
+      // Cooldown prüfen
+      unsigned long now = millis();
+      if (now - lastPumpStop[pump] < pumpCooldownMs) {
+        continue; // noch Sperrzeit
+      }
+      setPump(pump, true);
+      Serial.printf("Sensor %d (%d%%) startet Pumpe %d\n", sensor+1, s[sensor], pump+1);
+    }
   }
 }
 
 // === HTML-Seite ===
 String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   unsigned long nextInSec = timeToNextCheck();
-
-  String html = "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>";
+  String html; html.reserve(6000); // Fragmentierung reduzieren
+  html = "<!DOCTYPE html><html lang='de'><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<meta http-equiv='refresh' content='10'>";
+  // (Automatischer Meta-Reload entfernt – jetzt JS Polling via /status)
   html += "<title>ESP32 Bewässerung</title>";
   html += "<style>";
   html += "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f4f9; color: #333; margin: 0; padding: 20px; }";
@@ -134,16 +292,29 @@ String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   // Sensorwerte & Pumpen
   html += "<div class='card'>";
   html += "<h2>Live-Status</h2>";
+  html += "<p style='text-align:right;margin:0 0 10px 0'><button id='refreshNow' class='info-button' type='button'>Sofort Update</button></p>";
+  if (autoMode) {
+    html += "<p style='text-align:center;margin-top:-10px'><small>Manuelles Schalten im Automatikmodus deaktiviert.</small></p>";
+  }
   html += "<div class='grid-container'>";
   for (int i = 0; i < 3; i++) {
     int s = (i == 0) ? s1 : (i == 1) ? s2 : s3;
     html += "<div class='grid-item'>";
-    html += "<p><b>Sensor " + String(i+1) + ":</b> " + String(s) + " %</p>";
-    html += "<p><b>Pumpe " + String(i+1) + ":</b> " + String(pumpState[i] ? "EIN" : "AUS") + "</p>";
+    html += "<p><b>Sensor " + String(i+1) + ":</b> <span id='s" + String(i+1) + "'>" + String(s) + " %</span></p>";
     if (pumpState[i]) {
-      html += "<a href='/pump" + String(i+1) + "/off' class='button off'>Pumpe " + String(i+1) + " AUS</a>";
+      unsigned long elapsed = (millis() - pumpStart[i]) / 1000UL;
+      long remain = (long)(pumpDuration/1000UL) - (long)elapsed;
+      if (remain < 0) remain = 0;
+      html += "<p><b>Pumpe " + String(i+1) + ":</b> <span id='p" + String(i+1) + "'>EIN (" + String(elapsed) + "s, Rest ~" + String(remain) + "s)</span></p>";
     } else {
-      html += "<a href='/pump" + String(i+1) + "/on' class='button on'>Pumpe " + String(i+1) + " EIN</a>";
+      html += "<p><b>Pumpe " + String(i+1) + ":</b> <span id='p" + String(i+1) + "'>AUS</span></p>";
+    }
+    if (!autoMode) {
+      if (pumpState[i]) {
+        html += "<a href='/pump" + String(i+1) + "/off' class='button off'>Pumpe " + String(i+1) + " AUS</a>";
+      } else {
+        html += "<a href='/pump" + String(i+1) + "/on' class='button on'>Pumpe " + String(i+1) + " EIN</a>";
+      }
     }
     html += "</div>";
   }
@@ -156,6 +327,12 @@ String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   // Kalibrierung
   html += "<div class='grid-item'>";
   html += "<b>Kalibrierung</b> ([T]rocken/[N]ass)";
+  // Warnung falls Kalibrierwerte identisch
+  {
+    bool anyWarn=false; String warn;
+    for(int i=0;i<3;i++){ if(dryValue[i]==wetValue[i]){ if(!anyWarn){ warn="<p style='color:#c0392b;font-weight:bold;margin:6px 0'>Warnung: Kalibrierung unvollständig bei Sensor(en): "; anyWarn=true; } warn += String(i+1) + " "; } }
+    if(anyWarn){ warn += "– Trocken und Nass unterschiedlich messen!"; html += warn + "</p>"; }
+  }
   for (int i = 0; i < 3; i++) {
     int r = (i == 0) ? r1 : (i == 1) ? r2 : r3;
     html += "<p>S" + String(i+1) + ": " + String(dryValue[i]) + "/" + String(wetValue[i]);
@@ -181,18 +358,57 @@ String getHTML(int s1, int s2, int s3, int r1, int r2, int r3) {
   html += "<input type='submit' value='Setzen' class='button info-button'>";
   html += "</form>";
   html += "</div>";
+  // Prüfintervall
+  html += "<div class='grid-item'>";
+  html += "<b>Prüfintervall</b>";
+  html += "<form action='/setCheckInt' method='POST'>";
+  html += "<p>Alle <input type='number' name='ci' value='" + String(checkIntervalMs / 60000UL) + "' min></p>";
+  html += "<input type='submit' value='Setzen' class='button info-button'>";
+  html += "</form>";
+  html += "<p><small>1–1440 min (Standard 30).</small></p>";
+  html += "</div>";
+  // Cooldown
+  html += "<div class='grid-item'>";
+  html += "<b>Pumpen Cooldown</b>";
+  html += "<form action='/setCooldown' method='POST'>";
+  html += "<p>Pausenzeit: <input type='number' name='cd' value='" + String(pumpCooldownMs/1000) + "'> s</p>";
+  html += "<input type='submit' value='Setzen' class='button info-button'>";
+  html += "</form>";
+  html += "<p><small>Verhindert sofortiges Wiederanlaufen (0 = aus).</small></p>";
+  html += "</div>";
+  // (Ehemalige Reload-Konfiguration entfernt – Box entfernt)
+  // Mapping Sensor->Pumpe
+  html += "<div class='grid-item'>";
+  html += "<b>Sensor → Pumpe Mapping</b>";
+  html += "<form action='/setMapping' method='POST'>";
+  for (int s=0; s<3; s++) {
+    html += "<p>Sensor " + String(s+1) + ": <select name='s" + String(s) + "'>";
+    for (int p=0;p<3;p++) {
+      html += "<option value='" + String(p) + "'" + (sensorToPump[s]==p?" selected":"") + ">Pumpe " + String(p+1) + "</option>";
+    }
+    html += "</select></p>";
+  }
+  html += "<input type='submit' value='Speichern' class='button info-button'>";
+  html += "</form>";
+  html += "<p><small>Hinweis: Eine Pumpe kann mehreren Sensoren zugeordnet werden (erstes Triggern gewinnt).";
+  html += " Nicht zugeordnete Pumpen bleiben aus.</small></p>";
+  html += "</div>";
+  // (Filter-Konfiguration entfernt)
   html += "</div></div>";
 
   html += "</div>"; // end container
 
-  // Javascript für Countdown
-  if (autoMode) {
-    html += "<script>";
-    html += "var s=" + String(nextInSec) + ";";
-    html += "var cd=document.getElementById('countdown');";
-    html += "if(cd){var i=setInterval(function(){if(s>0){s--;cd.innerHTML='Nächste Prüfung in '+s+' Sekunden'}else{cd.innerHTML='Prüfung startet...';clearInterval(i)}},1000);}";
-    html += "</script>";
-  }
+  // Javascript für leichtes Polling ohne kompletten Reload
+  html += "<script>";
+  html += "const initialNext=" + String(nextInSec) + ";";
+  html += "let nextCheck=initialNext;";
+  html += "function localCountdown(){const cd=document.getElementById('countdown'); if(!cd) return; if(nextCheck>0){nextCheck--; cd.textContent='Nächste Prüfung in '+nextCheck+' Sekunden';} else {cd.textContent='Prüfung läuft...';}}";
+  html += "async function fetchStatus(){ try{ const r=await fetch('/status'); if(!r.ok) throw new Error(r.status); const j=await r.json(); nextCheck=j.nextCheck; for(let i=0;i<j.sensors.length;i++){ const se=document.getElementById('s'+(i+1)); if(se) se.textContent=j.sensors[i].percent+' %'; const pe=document.getElementById('p'+(i+1)); if(pe){ if(j.pumps[i].on){pe.textContent='EIN ('+j.pumps[i].elapsed+'s, Rest ~'+j.pumps[i].remain+'s)';} else {pe.textContent='AUS';} } } } catch(e){ console.log('Status fetch fail', e);} }";
+  html += "const POLL_MS=" + String(updateIntervalSec*1000) + ";";
+  html += "let pollTimer, countTimer;";
+  html += "function schedule(){ if(pollTimer) clearInterval(pollTimer); pollTimer=setInterval(fetchStatus, POLL_MS); if(countTimer) clearInterval(countTimer); countTimer=setInterval(localCountdown,1000); }";
+  html += "window.addEventListener('load', ()=>{ const bn=document.getElementById('refreshNow'); if(bn) bn.addEventListener('click', ()=>{fetchStatus();}); fetchStatus(); schedule(); });";
+  html += "</script>";
 
   html += "</body></html>";
   return html;
@@ -214,6 +430,8 @@ void handleRoot() {
 // === Setup ===
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  Serial.printf("Reset reason: %d FreeHeap=%u MinFree=%u\n", (int)esp_reset_reason(), ESP.getFreeHeap(), ESP.getMinFreeHeap());
 
   for (int i=0;i<3;i++) {
     pinMode(pumpPins[i], OUTPUT);
@@ -235,66 +453,166 @@ void setup() {
     server.on(("/pump" + String(i+1) + "/off").c_str(), [i](){ handlePump(i, false); });
   }
 
-  server.on("/mode/auto", [](){   autoMode = true;  server.sendHeader("Location", "/"); server.send(303); });
   server.on("/mode/manual", [](){ autoMode = false; server.sendHeader("Location", "/"); server.send(303); });
+  // /mode/auto: Umschalten + Stop laufender Pumpen
+  server.on("/mode/auto", [](){
+    autoMode = true;
+    for (int p=0;p<3;p++) if (pumpState[p]) { setPump(p,false); Serial.printf("Pumpe %d beim Auto-Umschalten gestoppt\n", p+1); }
+    server.sendHeader("Location", "/"); server.send(303);
+  });
 
   server.on("/checknow", [](){ performCheck(); server.sendHeader("Location", "/"); server.send(303); });
 
   server.on("/setThresholds", HTTP_POST, [](){
     if (server.hasArg("start")) startThreshold = server.arg("start").toInt();
     if (server.hasArg("stop"))  stopThreshold  = server.arg("stop").toInt();
-    Serial.printf("Neue Schwellen: Start=%d%%, Stop=%d%%\n", startThreshold, stopThreshold);
+  clampThresholds();
+  markConfigDirty();
+  Serial.printf("Neue Schwellen: Start=%d%%, Stop=%d%%\n", startThreshold, stopThreshold);
     server.sendHeader("Location", "/");
     server.send(303);
   });
 
   server.on("/setDuration", HTTP_POST, [](){
     if (server.hasArg("duration")) pumpDuration = server.arg("duration").toInt() * 1000;
-    Serial.printf("Neue max. Laufzeit: %lu s\n", pumpDuration / 1000);
+  clampPumpDuration();
+  markConfigDirty();
+  Serial.printf("Neue max. Laufzeit: %lu s\n", pumpDuration / 1000);
     server.sendHeader("Location", "/");
     server.send(303);
+  });
+
+  server.on("/setCooldown", HTTP_POST, [](){
+    if (server.hasArg("cd")) {
+      long v = server.arg("cd").toInt();
+      if (v < 0) v = 0; if (v > 3600) v = 3600; // Sekunden
+      pumpCooldownMs = (unsigned long)v * 1000UL;
+      clampCooldown();
+  markConfigDirty();
+      Serial.printf("Neuer Cooldown: %lus\n", pumpCooldownMs/1000);
+    }
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+
+  server.on("/setCheckInt", HTTP_POST, [](){
+    if (server.hasArg("ci")) {
+      long m = server.arg("ci").toInt();
+      if (m < 1) m = 1; if (m > 1440) m = 1440; // 1 min .. 24h
+      checkIntervalMs = (unsigned long)m * 60000UL;
+      clampCheckInterval();
+      markConfigDirty();
+      Serial.printf("Neues Prüfintervall: %ld min\n", m);
+    }
+    server.sendHeader("Location", "/"); server.send(303);
+  });
+
+  // (Filter-Route entfernt)
+
+  server.on("/setMapping", HTTP_POST, [](){
+    bool changed = false;
+    for (int s=0; s<3; s++) {
+      String name = "s" + String(s);
+      if (server.hasArg(name)) {
+        int v = server.arg(name).toInt();
+        if (v >=0 && v < 3 && sensorToPump[s] != v) { sensorToPump[s] = v; changed = true; }
+      }
+    }
+    if (changed) {
+  // Laufende Pumpen stoppen, um inkonsistente Stop-Logik zu vermeiden
+  bool stoppedAny=false; for(int p=0;p<3;p++){ if(pumpState[p]){ setPump(p,false); stoppedAny=true; Serial.printf("Pumpe %d wegen Mapping-Änderung gestoppt\n", p+1);} }
+  rebuildPumpToSensor();
+  Serial.printf("Neues Mapping: S1->P%d, S2->P%d, S3->P%d\n", sensorToPump[0]+1, sensorToPump[1]+1, sensorToPump[2]+1);
+  markConfigDirty();
+    }
+    server.sendHeader("Location", "/"); server.send(303);
   });
 
   // Kalibrierung über Buttons (pro Sensor)
   for (int i = 0; i < 3; i++) {
     server.on(("/setDry/" + String(i)).c_str(), [i](){
       dryValue[i] = analogRead(sensPins[i]);
-      Serial.printf("Neuer Trockenwert für Sensor %d: %d\n", i+1, dryValue[i]);
+  // Falls vertauscht, tauschen
+  if (dryValue[i] < wetValue[i]) { int tmp = dryValue[i]; dryValue[i] = wetValue[i]; wetValue[i] = tmp; Serial.printf("(Auto-Tausch) Kalibrierung Sensor %d vertauscht – korrigiert.\n", i+1); }
+  markConfigDirty();
+  Serial.printf("Neuer Trockenwert für Sensor %d: %d (Nass=%d)\n", i+1, dryValue[i], wetValue[i]);
       server.sendHeader("Location", "/"); server.send(303);
     });
     server.on(("/setWet/" + String(i)).c_str(), [i](){
       wetValue[i] = analogRead(sensPins[i]);
-      Serial.printf("Neuer Nasswert für Sensor %d: %d\n", i+1, wetValue[i]);
+  if (dryValue[i] < wetValue[i]) { int tmp = dryValue[i]; dryValue[i] = wetValue[i]; wetValue[i] = tmp; Serial.printf("(Auto-Tausch) Kalibrierung Sensor %d vertauscht – korrigiert.\n", i+1); }
+  markConfigDirty();
+  Serial.printf("Neuer Nasswert für Sensor %d: %d (Trocken=%d)\n", i+1, wetValue[i], dryValue[i]);
       server.sendHeader("Location", "/"); server.send(303);
     });
   }
 
+  // Leichter JSON Status Endpoint für Polling
+  server.on("/status", [](){
+    int svals[3];
+    for(int i=0;i<3;i++) svals[i]=readSoil(i);
+    unsigned long nowMs = millis();
+    unsigned long nextS = timeToNextCheck();
+    String json = "{"; // sehr kompakt halten
+    json += "\"mode\":\""; json += (autoMode?"auto":"manual"); json += "\",";
+    json += "\"nextCheck\":" + String(nextS) + ",";
+    json += "\"sensors\":[";
+    for(int i=0;i<3;i++){ if(i) json += ","; json += "{\"percent\":" + String(svals[i]) + "}"; }
+    json += "],\"pumps\":[";
+    for(int p=0;p<3;p++){
+      if(p) json += ",";
+      bool on = pumpState[p];
+      unsigned long elapsed = on ? (nowMs - pumpStart[p]) / 1000UL : 0UL;
+      long remain = on ? (long)(pumpDuration/1000UL) - (long)elapsed : 0L;
+      if (remain < 0) remain = 0;
+      json += "{\"on\":"; json += (on?"true":"false");
+      json += ",\"elapsed\":" + String(elapsed) + ",\"remain\":" + String(remain) + "}";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  });
+
   server.begin();
   lastCheck = millis();
+  rebuildPumpToSensor();
+  // Config zuerst laden, dann Diagnose ausgeben
+  loadConfig();
+  rebuildPumpToSensor();
+  diagLog(millis());
 }
 
 // === Loop ===
 void loop() {
   server.handleClient();
 
+  unsigned long now = millis();
+
   if (autoMode) {
-    unsigned long now = millis();
+  // Automatischer Start-Check nach konfigurierbarem Intervall
+  if (now - lastCheck >= checkIntervalMs) performCheck();
+  }
 
-    // Alle 10 Minuten Start-Check
-    if (now - lastCheck >= checkInterval) performCheck();
-
-    // Laufende Pumpen: 1) Stop-Schwelle  2) Sicherheits-Timeout
-    for (int i = 0; i < 3; i++) {
-      if (pumpState[i]) {
-        int moisture = readSoil(i);
-        if (moisture > stopThreshold) {          // <-- HIER: sofort stoppen bei >64%
-          setPump(i, false);
-          Serial.printf("Pumpe %d wegen >%d%% gestoppt (aktuell %d%%)\n", i+1, stopThreshold, moisture);
-        } else if (now - pumpStart[i] > pumpDuration) {
-          setPump(i, false);
-          Serial.printf("Pumpe %d nach %lus Timeout gestoppt\n", i+1, pumpDuration/1000);
-        }
+  // Laufende Pumpen überwachen (Timeout immer, Feuchte nur im Automatikmodus)
+  for (int pump = 0; pump < 3; pump++) {
+    if (!pumpState[pump]) continue;
+    bool stopped = false;
+    if (autoMode) {
+      int sensor = pumpToSensor[pump];
+      int moisture = (sensor >=0 && sensor < 3) ? readSoil(sensor) : 100; // failsafe
+      if (moisture > stopThreshold) {
+        setPump(pump, false);
+        Serial.printf("Pumpe %d wegen >%d%% gestoppt\n", pump+1, stopThreshold);
+        stopped = true;
       }
     }
+    if (!stopped && (now - pumpStart[pump] > pumpDuration)) {
+      setPump(pump, false);
+      Serial.printf("Pumpe %d nach %lus Timeout gestoppt (Modus: %s)\n", pump+1, pumpDuration/1000, autoMode?"AUTO":"MANUELL");
+    }
   }
+
+  if (configDirty && millis() >= nextConfigSave) saveConfig();
+  if (autoMode && now - lastDiag >= diagInterval) { lastDiag = now; diagLog(now); }
+  // Kurze Pause um Watchdog & WiFi Luft zu lassen, reduziert CPU-Spitzen
+  delay(2);
 }
